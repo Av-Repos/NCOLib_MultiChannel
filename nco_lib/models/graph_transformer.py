@@ -117,6 +117,135 @@ class EdgeGTEncoderLayer(BaseGTEncoderLayer):
         # Final residual connection
         return out + y
 
+class DeepMCGCN(BaseGTModel):
+    def __init__(self, node_in_dim: int, edge_in_dim: int, node_out_dim: int = 1, decoder: str = 'linear',
+                 hidden_dim: int = 128, n_encoder_layers: int = 3, mult_hidden: int = 4, n_heads: int = 8,
+                 dropout: float = 0.0, activation: str = 'relu', normalization: str = 'layer', bias: bool = False,
+                 logit_clipping: float = 10.0):
+        """
+        Node- and Edge-based featured Graph Transformer model class with node-based action outputs. It processes the first half
+        edge features independently from the second half edge features. That is, it assumes that the input consists of two graphs 
+        with edge_in_dim/2 edge features each that have to be processed independently.
+
+        :param node_in_dim: int: The input dimension of the node features.
+        :param edge_in_dim: int: The input dimension of the edge features.
+        :param node_out_dim: int: The output dimension of the node-based action logits.
+        :param decoder: str: The decoder to use. Options: 'linear', 'attention'.
+        :param hidden_dim: int: The hidden dimension of the model.
+        :param n_encoder_layers: int: The number of layers in the model.
+        :param mult_hidden: int: The multiplier for the hidden dimension of the MLP.
+        :param n_heads: int: The number of attention heads.
+        :param dropout: float: The dropout rate.
+        :param activation: str: The activation function to use in the MLP.
+        :param normalization: str: The normalization to use.
+        :param bias: bool: Whether to use bias in the linear layers.
+        :param logit_clipping: float: The logit clipping value. 0.0 means no clipping. 10.0 is a commonly used value.
+        """
+        super(DeepMCGCN, self).__init__(out_dim=node_out_dim, hidden_dim=hidden_dim, logit_clipping=logit_clipping)
+        self.node_in_dim = node_in_dim
+        self.node_out_dim = node_out_dim
+        self.edge_in_dim = edge_in_dim
+
+        self.in_node_projection = nn.Linear(self.node_in_dim, hidden_dim, bias=bias)
+        self.in_node_projection_1 = nn.Linear(self.node_in_dim, hidden_dim, bias=bias)
+        self.in_node_projection_2 = nn.Linear(self.node_in_dim, hidden_dim, bias=bias)
+
+        self.in_edge_projection = nn.Linear(int(self.edge_in_dim/2), hidden_dim, bias=bias)
+        self.in_edge_projection_1 = nn.Linear(int(self.edge_in_dim/2), hidden_dim, bias=bias)
+        self.in_edge_projection_2 = nn.Linear(int(self.edge_in_dim/2), hidden_dim, bias=bias)
+
+        self.encoder_layers = nn.ModuleList([EdgeGTEncoderLayer(hidden_dim, mult_hidden, n_heads, dropout, activation, normalization, bias)
+                                            for _ in range(n_encoder_layers)])
+        self.encoder_layers_1 = nn.ModuleList([EdgeGTEncoderLayer(hidden_dim, mult_hidden, n_heads, dropout, activation, normalization, bias)
+                                            for _ in range(n_encoder_layers)])
+        self.encoder_layers_2 = nn.ModuleList([EdgeGTEncoderLayer(hidden_dim, mult_hidden, n_heads, dropout, activation, normalization, bias)
+                                            for _ in range(n_encoder_layers)])
+
+        self.mlp = MLP(hidden_dim=3*hidden_dim, mult_hidden=1, activation=activation, dropout=dropout, bias=bias)
+        self.out_node_projection = nn.Linear(3*hidden_dim, hidden_dim, bias=bias)
+
+        assert decoder in DECODER_DICT.keys(), f"Decoder must be one of {DECODER_DICT.keys()}"
+        self.decoder = DECODER_DICT[decoder](hidden_dim, node_out_dim, n_heads, False, bias=bias)
+
+    def forward(self, state):
+        # Reshape the node features to (batch_size * pomo_size, n_nodes, features)
+        node_features = state.node_features.clone().view(state.batch_size*state.pomo_size, state.problem_size, -1)
+
+        # Add memory information to node features
+        if state.memory_info is not None:
+            memory = state.memory_info.clone().view(state.batch_size*state.pomo_size, state.problem_size, -1)
+            node_features = torch.cat([node_features, memory], dim=-1)
+
+        # Edge features
+        edges = state.edge_features.clone().view(state.batch_size*state.pomo_size, state.problem_size, state.problem_size, -1)
+
+        #Combined channel (graph)
+        edge_feat = edges[:,:,:,:int(self.edge_in_dim/2)] + edges[:,:,:,int(self.edge_in_dim/2):]
+        #First channel (graph)
+        edge_feat_1 = edges[:,:,:,:int(self.edge_in_dim/2)]
+        #Second channel (graph)
+        edge_feat_2 = edges[:,:,:,int(self.edge_in_dim/2):]
+
+        # Initial projection from node features to node embeddings
+
+        #Combined channel (graph)
+        h = self.in_node_projection(node_features)
+        #First channel (graph)
+        h1 = self.in_node_projection_1(node_features)
+        #Second channel (graph)
+        h2 = self.in_node_projection_2(node_features)
+
+        # Initial projection from edge features to edge embeddings
+        
+        #Combined channel (graph)
+        e = self.in_edge_projection(edge_feat)
+        #First channel (graph)
+        e1 = self.in_edge_projection_1(edge_feat_1)
+        #Second channel (graph)
+        e2 = self.in_edge_projection_2(edge_feat_2)
+
+        # Pass through the layers
+
+        #Initialize residual connections
+        h_res = torch.clone(h)
+        h1_res = torch.clone(h1)
+        h2_res = torch.clone(h2)
+        
+        #Parallel encoders phase
+        for i,_ in enumerate(self.encoder_layers):
+
+            #Process encoder layer
+            h = self.encoder_layers[i](h, e)
+            h1 = self.encoder_layers_1[i](h1, e1)
+            h2 = self.encoder_layers_2[i](h2, e2)
+
+            #Add connections between enconders + residual connection
+            h_ = h + h1 + h2 + h_res
+            h1_ = h1 + h2 + h1_res
+            h2_ = h1 + h2 + h2_res
+
+            h = h_
+            h1 = h1_
+            h2 = h2_
+
+            #Update residual connections
+            h_res = torch.clone(h)
+            h1_res = torch.clone(h1)
+            h2_res = torch.clone(h2)
+        
+        # MLP that joins the information from all channels
+        h = self.mlp(torch.cat([h, h1, h2], dim=-1))
+        h = self.out_node_projection(h)
+
+        # Decode to node-based action logits
+        out, aux_node = self.decoder(h)
+
+        if self.clip_logits:
+            out = out / self.sqrt_embedding_dim
+            out = self.logit_clipping * torch.tanh(out)
+
+        return out, aux_node
+
 
 class BaseGTModel(nn.Module):
     def __init__(self, out_dim: int, hidden_dim: int, logit_clipping: float):
